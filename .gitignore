@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Environment variables - NEVER commit real secrets
+.env
+!.env.example
+
+# OS / editor junk
+.DS_Store
+.vscode/
+*.log
+
+# Docker
+*.pid
