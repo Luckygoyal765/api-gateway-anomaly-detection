@@ -1,36 +1,24 @@
 """
-Anomaly detector - Week 5 (v3: Isolation Forest)
+Anomaly detector - Week 5 (v5: handles zero-variance baseline)
 
-Upgrades the earlier statistical (z-score) detector to a real
-unsupervised ML model: Isolation Forest.
+Fixes a real issue found after the v4 train/score separation fix:
+Isolation Forest needs VARIANCE in its training data to build any
+meaningful splits. If every baseline window looks identical (e.g. from
+uniform manual curl testing), the model has nothing to learn from and
+will silently pass everything through, including real attacks - not
+because the model is broken, but because it was never given anything
+to compare against.
 
-The core idea of Isolation Forest: it builds random decision trees
-that repeatedly split the data on random features/thresholds. A point
-that's genuinely different from the rest gets isolated into its own
-tiny branch in very few splits, because it doesn't "blend in" with
-everything else. A normal point takes many more splits to isolate,
-since it looks like a lot of its neighbors. The model scores every
-point by how quickly it got isolated - fast isolation = anomaly.
-
-This is unsupervised: we never tell the model what an "attack" looks
-like. It just learns the shape of normal traffic and flags whatever
-doesn't fit that shape.
-
-Instead of one number (request count) per window like the old
-detector, we compute several FEATURES per (IP, time window):
-  - request_count:     how many requests this IP made in the window
-  - error_rate:         fraction of requests that were non-2xx
-  - unique_path_ratio:  how many distinct paths relative to request count
-                         (a bot hammering ONE endpoint looks different
-                         from a real user browsing several pages)
-  - burstiness:         how uneven the spacing between requests is
-                         (a human clicking around is irregular; a
-                         script firing at a fixed rate is very regular
-                         -  low burstiness can itself be suspicious)
+Fix: before trusting the ML model, check if the baseline actually has
+variance. If it doesn't, fall back to a simple, explicit rule instead
+of blindly trusting a model with no discriminative power. This is a
+local-testing edge case - real traffic naturally varies - but a
+production system should never silently trust a degenerate model.
 """
 
 import os
 import time
+import json
 import statistics
 from collections import defaultdict, deque
 
@@ -39,23 +27,20 @@ import redis
 from sklearn.ensemble import IsolationForest
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-WINDOW_SECONDS = 15       # size of each time window used for feature extraction
-RETRAIN_INTERVAL = 15     # how often we recompute windows and retrain
-MAX_TRAINING_WINDOWS = 200  # cap on how much history we train the model on
-MIN_SAMPLES_TO_TRAIN = 10   # need at least this many windows before ML kicks in
-CONTAMINATION = 0.1         # our rough prior: ~10% of windows might be anomalous
+WINDOW_SECONDS = 15
+BASELINE_MIN = 10
+MAX_BASELINE = 200
+CONTAMINATION = 0.05
+MIN_VARIANCE = 1e-6  # below this, treat a feature as having no real variance
 
-# ip -> deque of (timestamp, path, status) for the CURRENT open window
 current_window = defaultdict(list)
-# rolling buffer of past (ip, window_start, feature_vector) samples used for training
-training_buffer = deque(maxlen=MAX_TRAINING_WINDOWS)
-
+baseline_buffer = deque(maxlen=MAX_BASELINE)
 current_window_start = None
+model_activated = False
+client_redis = None
 
 
 def extract_features(records):
-    """Turn a list of (timestamp, path, status) tuples from one
-    (ip, window) into a fixed-size numeric feature vector."""
     count = len(records)
     if count == 0:
         return None
@@ -66,12 +51,10 @@ def extract_features(records):
 
     error_count = sum(1 for s in statuses if not s.startswith('2'))
     error_rate = error_count / count
-
     unique_path_ratio = len(set(paths)) / count
 
     if count > 1:
         gaps = [timestamps[i + 1] - timestamps[i] for i in range(count - 1)]
-        # low stdev in gaps = very regular/robotic timing = "burstiness" signal
         burstiness = statistics.pstdev(gaps) if len(gaps) > 1 else 0.0
     else:
         burstiness = 0.0
@@ -79,68 +62,103 @@ def extract_features(records):
     return [count, error_rate, unique_path_ratio, burstiness]
 
 
+def has_sufficient_variance(X_train):
+    """Isolation Forest can't discriminate anything if every training
+    point is identical. Check if AT LEAST ONE feature has real spread."""
+    return bool(np.any(np.std(X_train, axis=0) > MIN_VARIANCE))
+
+
+def flag_anomaly(tag, ip, now, features, score=None):
+    count, error_rate, unique_path_ratio, burstiness = features
+    score_str = f"score={score:.3f}" if score is not None else "score=n/a (fallback rule)"
+    print(
+        f"[{tag}] IP {ip} flagged ({score_str}): {int(count)} reqs, "
+        f"error_rate={error_rate:.2f}, unique_path_ratio={unique_path_ratio:.2f}, "
+        f"burstiness={burstiness:.3f}",
+        flush=True,
+    )
+    record = json.dumps({
+        'ip': ip,
+        'timestamp': int(now * 1000),
+        'score': round(float(score), 3) if score is not None else None,
+        'requests': int(count),
+        'error_rate': round(error_rate, 3),
+        'unique_path_ratio': round(unique_path_ratio, 3),
+        'burstiness': round(burstiness, 4),
+    })
+    client_redis.lpush('ml_anomalies', record)
+    client_redis.ltrim('ml_anomalies', 0, 49)
+
+
 def roll_window_and_train(now):
-    """Close out the current time window, extract its features per IP,
-    add them to the training buffer, retrain the model on the buffer,
-    and score the just-closed window's IPs against it."""
-    global current_window, current_window_start
+    global current_window, current_window_start, model_activated
 
     closed_ips = list(current_window.keys())
-    if not closed_ips:
-        current_window_start = now
-        return
-
-    new_samples = []  # (ip, feature_vector) for THIS window only
-    for ip in closed_ips:
-        features = extract_features(current_window[ip])
-        if features is not None:
-            training_buffer.append(features)
-            new_samples.append((ip, features))
-
+    closed_data = current_window
     current_window = defaultdict(list)
     current_window_start = now
 
-    if len(training_buffer) < MIN_SAMPLES_TO_TRAIN:
+    if not closed_ips:
+        return
+
+    new_samples = []
+    for ip in closed_ips:
+        features = extract_features(closed_data[ip])
+        if features is not None:
+            new_samples.append((ip, features))
+
+    if len(baseline_buffer) < BASELINE_MIN:
+        for ip, features in new_samples:
+            baseline_buffer.append(features)
         print(
-            f"[ML] Collecting baseline data... {len(training_buffer)}/"
-            f"{MIN_SAMPLES_TO_TRAIN} windows so far",
+            f"[ML] Building baseline... {len(baseline_buffer)}/{BASELINE_MIN} windows",
             flush=True,
         )
         return
 
-    # Train fresh on the whole rolling buffer. This is intentionally
-    # simple (retrain from scratch each cycle) rather than incremental -
-    # Isolation Forest trains fast enough on this small a dataset that
-    # it doesn't matter for a project at this scale.
-    X_train = np.array(list(training_buffer))
+    if not model_activated:
+        print(
+            f"[ML] Baseline ready ({len(baseline_buffer)} windows) - "
+            f"now scoring new traffic against it.",
+            flush=True,
+        )
+        model_activated = True
+
+    X_train = np.array(list(baseline_buffer))
+
+    if not has_sufficient_variance(X_train):
+        # The model has nothing to learn from - fall back to a simple,
+        # explicit safety net instead of trusting a degenerate model.
+        baseline_counts = [f[0] for f in baseline_buffer]
+        baseline_max = max(baseline_counts)
+        for ip, features in new_samples:
+            count, error_rate = features[0], features[1]
+            if count > max(baseline_max * 5, 10) or error_rate > 0.8:
+                flag_anomaly('FALLBACK-ANOMALY', ip, now, features)
+            else:
+                baseline_buffer.append(features)
+        return
+
     model = IsolationForest(contamination=CONTAMINATION, random_state=42)
     model.fit(X_train)
 
-    # Score only the windows that just closed, not the whole buffer -
-    # we only care about flagging NEW behavior, not re-flagging history.
     for ip, features in new_samples:
         X_sample = np.array([features])
-        prediction = model.predict(X_sample)[0]      # -1 = anomaly, 1 = normal
-        score = model.decision_function(X_sample)[0]  # lower = more anomalous
+        prediction = model.predict(X_sample)[0]
+        score = model.decision_function(X_sample)[0]
 
         if prediction == -1:
-            count, error_rate, unique_path_ratio, burstiness = features
-            print(
-                f"[ML-ANOMALY] IP {ip} flagged by Isolation Forest "
-                f"(score={score:.3f}): {int(count)} reqs, "
-                f"error_rate={error_rate:.2f}, "
-                f"unique_path_ratio={unique_path_ratio:.2f}, "
-                f"burstiness={burstiness:.3f}",
-                flush=True,
-            )
+            flag_anomaly('ML-ANOMALY', ip, now, features, score)
+        else:
+            baseline_buffer.append(features)
 
 
 def main():
-    global current_window_start
+    global current_window_start, client_redis
 
-    client = redis.from_url(REDIS_URL, decode_responses=True)
+    client_redis = redis.from_url(REDIS_URL, decode_responses=True)
     print(
-        "Anomaly detector (Isolation Forest) started, reading from "
+        "Anomaly detector (Isolation Forest, v5) started, reading from "
         "'traffic_logs' stream...",
         flush=True,
     )
@@ -150,7 +168,7 @@ def main():
 
     while True:
         try:
-            response = client.xread({'traffic_logs': last_id}, block=1000, count=100)
+            response = client_redis.xread({'traffic_logs': last_id}, block=1000, count=100)
 
             if response:
                 _, entries = response[0]
