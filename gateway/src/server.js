@@ -7,6 +7,7 @@ const rateLimiter = require('./middleware/rateLimiter');
 const trafficLogger = require('./middleware/trafficLogger');
 const authRoutes = require('./routes/auth');
 const buildProxyRoutes = require('./routes/proxy');
+const statsRoutes = require('./routes/stats');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -22,6 +23,9 @@ app.use(express.json());
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
+
+// Dashboard statistics - read-only view of recent traffic.
+app.use('/stats', statsRoutes);
 
 // Traffic logging sees EVERY request first, regardless of what
 // happens to it next - the anomaly detector needs the complete
