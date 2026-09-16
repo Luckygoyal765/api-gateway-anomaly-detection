@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const morgan = require('morgan');
 
 const authMiddleware = require('./middleware/auth');
@@ -15,6 +16,7 @@ const PORT = process.env.PORT || 8080;
 // morgan logs every request that hits the gateway - this is your first
 // window into traffic patterns, and later it's the raw material the
 // anomaly detection service will consume.
+app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
 
