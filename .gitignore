@@ -14,3 +14,10 @@ __pycache__/
 
 # Docker
 *.pid
+# Database data
+postgres_data/
+redis_data/
+
+# Database data
+postgres_data/
+redis_data/

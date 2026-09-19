@@ -2,21 +2,57 @@
 
 ## 1. System Overview
 
-This system is a distributed API gateway that sits in front of backend
-services, handling authentication, rate limiting, and traffic routing,
-while streaming request metadata to a real-time anomaly detection
-service. It was built incrementally to demonstrate core system design
-concepts: edge authentication, distributed state coordination, graceful
-degradation, and observability.
+This system is a distributed API gateway that sits in front of microservices, handling authentication, atomic rate limiting, and request proxying while streaming telemetry to an asynchronous Machine Learning anomaly detection engine. It features a real-time SIEM dashboard for operational monitoring and live threat feeds.
+
+## Architecture & Service Boundaries
+
+[ Client Requests ]
+│
+▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Express API Gateway                       │
+│  - JWT Verification (/auth)                                    │
+│  - Token Bucket Rate Limiting (Atomic Redis Lua Script)         │
+│  - Service Proxying (/api/service-a, /api/service-b)           │
+│  - Telemetry Logging (Async XADD to 'traffic_logs')             │
+└──────────────┬──────────────────────────────────┬───────────────┘
+│                                  │
+▼                                  ▼
+┌──────────────────────────────┐   ┌──────────────────────────────┐
+│        Redis (Port 6379)     │   │     Backend Microservices    │
+│  - Rate Limit Keys           │   │  - Service A (Products:4001) │
+│  - 'traffic_logs' (Stream)   │   │  - Service B (Orders:4002)   │
+│  - 'ml_anomalies' (List)     │   └──────────────────────────────┘
+└──────────────┬───────────────┘
+│
+┌───────┴──────────────────────┐
+│                              │
+▼                              ▼
+┌───────────────────────────┐  ┌───────────────────────────┐
+│   Python Anomaly Detector │  │   Express Stats Service   │
+│  - Isolation Forest Model │  │   - GET /stats           │
+│  - 15s Sliding Windows    │  │   - Aggregates Logs      │
+│  - Degenerate Baseline    │  │   - Fetches ML Alerts    │
+│    Fallback Safety Nets   │  └─────────────┬─────────────┘
+└───────────────────────────┘                │
+▼
+┌───────────────────────────┐
+│ React Telemetry Dashboard │
+│ - Time-series Charts      │
+│ - Live ML Threat Feed     │
+└───────────────────────────┘
 
 ## 2. Components
 
-| Component | Responsibility | Technology |
+| Component | Responsibility | Tech Stack |
 |---|---|---|
-| API Gateway | Auth, rate limiting, routing, traffic logging | Node.js + Express |
-| Backend Services | Business logic (mocked for this project) | Node.js + Express |
-| Redis | Shared state: rate limit counters, traffic log stream | Redis 7 |
-| Anomaly Detector | Reads live traffic, flags statistical outliers | Python |
+| **API Gateway** | Authentication, rate limiting, route proxying, traffic streaming | Node.js + Express |
+| **Backend Services** | Core business logic (`service-a`, `service-b`) | Node.js + Express |
+| **Redis** | Central state: Token bucket counters, `traffic_logs` Stream, `ml_anomalies` List | Redis 7 |
+| **Anomaly Detector** | Ingests logs, extracts feature vectors, trains Isolation Forest, writes flags | Python, Scikit-Learn, NumPy |
+| **Stats API** | Aggregates 60s sliding-window traffic telemetry & ML alerts for UI | Node.js + Express |
+| **Operations Dashboard**| Real-time time-series trends, metric cards, live SIEM anomaly alerts feed | React 19, Recharts, Vite |
+
 
 ## 3. Request Lifecycle
 
