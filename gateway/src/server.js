@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+const client = require('prom-client');
 
 const authMiddleware = require('./middleware/auth');
 const rateLimiter = require('./middleware/rateLimiter');
@@ -13,39 +14,58 @@ const statsRoutes = require('./routes/stats');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// morgan logs every request that hits the gateway - this is your first
-// window into traffic patterns, and later it's the raw material the
-// anomaly detection service will consume.
+// 1. Prometheus System Metrics Setup
+client.collectDefaultMetrics();
+
+const httpRequestDurationSeconds = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.05, 0.1, 0.3, 0.5, 1, 2, 5]
+});
+
+// Middleware to record request duration
+app.use((req, res, next) => {
+  const end = httpRequestDurationSeconds.startTimer();
+  res.on('finish', () => {
+    end({
+      method: req.method,
+      route: req.route ? req.route.path : req.path,
+      status_code: res.statusCode
+    });
+  });
+  next();
+});
+
+// 2. Standard Global Middlewares
 app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
 
-// Health check - no auth needed. Load balancers/orchestrators ping this
-// to know if this gateway instance is alive.
+// 3. Metrics & Health Endpoints (Unprotected)
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// Dashboard statistics - read-only view of recent traffic.
-app.use('/stats', statsRoutes);
-
-// Traffic logging sees EVERY request first, regardless of what
-// happens to it next - the anomaly detector needs the complete
-// picture, including rejected and rate-limited requests.
+// 4. Traffic Logging & Rate Limiting
 app.use(trafficLogger);
-
-// Rate limiting applies to EVERYTHING below this line, including the
-// login endpoint - this is what stops someone from brute-forcing logins
-// or hammering the gateway before they've even gotten a token.
 app.use(rateLimiter);
 
-// Public: anyone can hit this to get a token for testing.
+// 5. Unprotected API Routes
+app.use('/stats', statsRoutes);
 app.use('/auth', authRoutes);
 
-// Everything below this line requires a valid JWT.
+// 6. Protected Routes (Requires JWT Auth)
+// Note: If you want to test proxying without JWT tokens during testing, 
+// comment out the line below temporarily:
 app.use(authMiddleware);
 
-// Route to backend services based on path prefix.
+// 7. Dynamic Proxy Routes Execution
 buildProxyRoutes(app);
 
 app.listen(PORT, () => {

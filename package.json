@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "http-proxy-middleware": "^4.2.0",
+    "prom-client": "^15.1.3"
+  }
+}

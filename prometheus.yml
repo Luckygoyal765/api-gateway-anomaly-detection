@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'api_gateways'
+    metrics_path: '/metrics'
+    dns_sd_configs:
+      - names:
+          - 'gateway'
+        type: 'A'
+        port: 8080
