@@ -27,6 +27,11 @@ function buildProxyRoutes(app) {
     target: process.env.SERVICE_A_URL || 'http://service-a:4001',
     changeOrigin: true,
     pathRewrite: { '^/api/service-a': '' },
+    onProxyReq: (proxyReq, req, res) => {
+      if (req.requestId) {
+        proxyReq.setHeader('X-Request-ID', req.requestId);
+      }
+    },
     onError: (err, req, res) => {
       res.status(503).json({
         error: 'Service A is currently unavailable or degraded.',
@@ -56,6 +61,11 @@ function buildProxyRoutes(app) {
     target: process.env.SERVICE_B_URL || 'http://service-b:4002',
     changeOrigin: true,
     pathRewrite: { '^/api/service-b': '' },
+    onProxyReq: (proxyReq, req, res) => {
+      if (req.requestId) {
+        proxyReq.setHeader('X-Request-ID', req.requestId);
+      }
+    },
     onError: (err, req, res) => {
       res.status(503).json({
         error: 'Service B is currently unavailable or degraded.',

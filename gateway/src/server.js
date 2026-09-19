@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const client = require('prom-client');
+const crypto = require('crypto');
 
 const authMiddleware = require('./middleware/auth');
 const rateLimiter = require('./middleware/rateLimiter');
@@ -42,6 +43,14 @@ app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json());
 
+// 2.1 Distributed Request Tracing Middleware
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  next();
+});
+
 // 3. Metrics & Health Endpoints (Unprotected)
 app.get('/metrics', async (req, res) => {
   res.set('Content-Type', client.register.contentType);
@@ -61,8 +70,6 @@ app.use('/stats', statsRoutes);
 app.use('/auth', authRoutes);
 
 // 6. Protected Routes (Requires JWT Auth)
-// Note: If you want to test proxying without JWT tokens during testing, 
-// comment out the line below temporarily:
 app.use(authMiddleware);
 
 // 7. Dynamic Proxy Routes Execution
