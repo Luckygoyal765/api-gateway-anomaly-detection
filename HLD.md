@@ -123,16 +123,3 @@ Automated k6 load tests were executed under heavy virtual user (VU) concurrency 
   * **Failure SLA:** `http_req_failed{status:500} < 0.01` (Passed)
 * **Circuit Breaker Trip & Recovery:** Verified fast fallback behavior during simulated service downtime (`503` returned instantly) followed by automatic `half-open` recovery to `200 OK` once downstream containers restarted.
 
----
-
-## 6. Interview Talking Points & Architecture Highlights
-
-1. **Why Fail-Open for Rate Limiting?**
-   > *"For an API Gateway, availability takes precedence over strict rate enforcement. If Redis experiences a total outage, our middleware catches the exception, logs a Prometheus counter metric, and allows requests through so legitimate users aren't locked out."*
-
-2. **How do you handle cascading failures when downstream services fail?**
-   > *"We wrap proxy calls in Opossum circuit breakers. If a downstream service slows down or drops requests above a 50% threshold, the circuit trips OPEN. Subsequent calls short-circuit immediately with a fast 503 fallback, saving thread resources and gateway memory."*
-
-3. **How do you achieve end-to-end trace correlation in a microservice environment?**
-   > *"NGINX assigns or forwards an `X-Request-ID` at ingress. Our Express gateway context middleware captures this ID, passes it to Redis streams, forwards it downstream via http-proxy-middleware headers, and embeds it into PostgreSQL audit tables."*
-
